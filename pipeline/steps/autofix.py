@@ -27,13 +27,85 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
+
+
+DROP_LINES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_IMAGES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _clip_box(line):
+    class_id, cx, cy, w, h = parse_yolo_line(line)
+    left, right = max(0.0, cx - w / 2), min(1.0, cx + w / 2)
+    top, bottom = max(0.0, cy - h / 2), min(1.0, cy + h / 2)
+    if right <= left or bottom <= top:
+        return ""
+    return f"{class_id} {(left + right) / 2} {(top + bottom) / 2} {right - left} {bottom - top}"
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    remove_stems, needs_label = set(), set()
+    line_codes = defaultdict(dict)
+    rename_classes = False
+
+    for issue in issues:
+        if issue.severity != ERROR:
+            continue
+        code, stem = issue.code, issue.image
+        if code in REMOVE_IMAGES or code.startswith("DUP_IMAGE_"):
+            remove_stems.add(stem)
+        elif code == "MISSING_LABEL_FILE":
+            needs_label.add(stem)
+        elif code == "BAD_CLASS_NAME":
+            rename_classes = True
+        elif issue.line is not None and (code in DROP_LINES or code == "BOX_OUT_OF_IMAGE"):
+            line_codes[stem].setdefault(issue.line, set()).add(code)
+
+    for path in ds.image_files():
+        stem = path.stem
+        if stem in remove_stems:
+            path.unlink()
+            ds.label_path(stem).unlink(missing_ok=True)
+            fixes.append(dict(image=stem, line=None, action="remove_image", before=path.name, after=""))
+        elif stem in needs_label and not ds.label_path(stem).exists():
+            fixes.append(dict(image=stem, line=None, action="needs_label",
+                              before="(không có file)", after="chuyển người gán"))
+
+    for path in ds.label_files():
+        stem = path.stem
+        if stem not in line_codes or stem in remove_stems:
+            continue
+        kept = []
+        changed = False
+        for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True), 1):
+            codes = line_codes[stem].get(line_no)
+            if not codes:
+                kept.append(line)
+                continue
+            before = line.rstrip("\r\n")
+            after = "" if codes & DROP_LINES else _clip_box(before)
+            action = "clip_box" if after else "drop_line"
+            if after:
+                kept.append(after + "\n")
+            fixes.append(dict(image=stem, line=line_no, action=action, before=before, after=after))
+            changed = True
+        if changed:
+            path.write_text("".join(kept), encoding="utf-8")
+
+    if rename_classes:
+        path = ds.yaml_path
+        data = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}) if path.exists() else {}
+        names = dict(enumerate(cfg["classes"]))
+        if ds.yaml_names() != names:
+            before = data.get("names")
+            data["names"] = names
+            path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+            fixes.append(dict(image="data.yaml", line=None, action="rename_classes",
+                              before=str(before), after=str(names)))
+
+    return fixes

@@ -11,14 +11,39 @@ Cây quyết định Day 07 (slide Day 09: "Lỗi bắt buộc chặn pipeline; 
 
 Tỉ lệ cảnh báo = (số ẢNH khác nhau có ≥ 1 cảnh báo) / (tổng số ảnh).  Chú ý:
 - chỉ đếm issue có `image` nằm trong `image_stems` (bỏ "<dataset>", "data.yaml");
-- bỏ qua ảnh nằm trong `reviewed` (người đã xem, cảnh báo của ảnh đó coi như đã xử lý) — nhưng LỖI BẮT BUỘC thì không bao giờ được bỏ qua;
+- bỏ qua ảnh nằm trong `reviewed` (người đã xem, cảnh báo của ảnh đó coi như đã xử lý) — nhưng LỖI BẮT BUỘC thì không bao giờ được bỏ qua;0
 - mẫu số là số ảnh, không phải số issue.
 
 Trả về dict: decision, n_errors, n_warn_images, n_images, warn_ratio (làm tròn 4 chữ số), reasons (list[str], giải thích bằng tiếng Việt, có số liệu).
 """
-from ..common import ERROR, WARN  # noqa: F401
+from ..common import ERROR, WARN
 
 
 def decide(issues, image_stems, cfg, reviewed=frozenset()):
-    # TODO
-    raise NotImplementedError("gate chưa làm")
+    image_stems = set(image_stems)
+    n_errors = 0
+    warn_images = set()
+    for issue in issues:
+        if issue.severity == ERROR:
+            n_errors += 1
+        elif issue.severity == WARN and issue.image in image_stems and issue.image not in reviewed:
+            warn_images.add(issue.image)
+
+    n_images = len(image_stems)
+    n_warn_images = len(warn_images)
+    warn_ratio = n_warn_images / n_images if n_images else 0.0
+    hold_threshold = cfg["gate"]["warn_ratio_hold"]
+    warning_summary = f"{n_warn_images}/{n_images} ảnh còn cảnh báo chưa duyệt ({warn_ratio:.2%})"
+
+    if n_errors:
+        decision = "Rework"
+        reason = f"Còn {n_errors} lỗi bắt buộc"
+    elif warn_ratio >= hold_threshold:
+        decision = "Hold"
+        reason = f"{warning_summary}, đạt hoặc vượt ngưỡng {hold_threshold:.2%}"
+    else:
+        decision = "Release"
+        reason = f"Không còn lỗi bắt buộc và {warning_summary}, dưới ngưỡng {hold_threshold:.2%}"
+
+    return dict(decision=decision, n_errors=n_errors, n_warn_images=n_warn_images,
+                n_images=n_images, warn_ratio=round(warn_ratio, 4), reasons=[reason])
